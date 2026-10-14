@@ -12,15 +12,16 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .export import export_png
-from .model import Cell, Chart, Signal, clock_wave, load_file, sample_chart, save_file
+from .model import DEFAULT_MULTI_MAX, MAX_LEVEL_LIMIT, Cell, Chart, Signal, clock_wave, load_file, sample_chart, save_file
 from .render import Line, Poly, Style, Text, build
 from .textfmt import ParseError, format_chart, parse_chart
 
 APP_NAME = "Time Chart Maker"
-HINT = ("クリック: High/Low 切替（ドラッグで連続入力）　バス行: クリックで値入力　"
+HINT = ("クリック: High/Low 切替（ドラッグで連続入力）　多値行: クリックした高さの値　バス行: クリックで値入力　"
         "右クリック: メニュー　目盛りクリック: マーカー追加/削除　信号名ドラッグ: 並べ替え")
 NOTATION_HELP = """記法:  名前 : 波形 | バス値, ...
   0 Low   1 High   x 不定
+  0〜9 多値 (| max=5, 0=停止, 2=低速)
   p/n クロック(1 サイクル)
   = バス値   . 継続
   @title タイトル
@@ -69,6 +70,37 @@ class ClockDialog(simpledialog.Dialog):
 
     def apply(self) -> None:
         self.result = (self.name_var.get().strip() or "CLK", self.period_var.get(), self.rising_var.get())
+
+
+class LevelNamesDialog(simpledialog.Dialog):
+    """多値信号の各値の意味を入力するダイアログ。"""
+
+    def __init__(self, parent: tk.Misc, sig: Signal):
+        self.sig = sig
+        super().__init__(parent, f"{sig.name} の値の意味")
+
+    def body(self, master: tk.Frame):
+        ttk.Label(master, text="各値の意味を入力してください（空欄は数字のみ表示）",
+                  foreground="#6b7280").grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 8))
+        self.vars: dict[int, tk.StringVar] = {}
+        first = None
+        for i, k in enumerate(range(self.sig.max_level, -1, -1), start=1):
+            ttk.Label(master, text=f"値 {k}").grid(row=i, column=0, sticky="e", padx=4, pady=2)
+            var = tk.StringVar(value=self.sig.level_names.get(k, ""))
+            entry = ttk.Entry(master, textvariable=var, width=24)
+            entry.grid(row=i, column=1, sticky="we", padx=4, pady=2)
+            self.vars[k] = var
+            first = first or entry
+        return first
+
+    def validate(self) -> bool:
+        if any("," in v.get() for v in self.vars.values()):
+            messagebox.showwarning("入力エラー", "意味に「,」は使えません", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        self.result = {k: v.get().strip() for k, v in self.vars.items() if v.get().strip()}
 
 
 class App(tk.Tk):
@@ -138,6 +170,7 @@ class App(tk.Tk):
         m.add_command(label="信号を追加", command=self.add_signal)
         m.add_command(label="バスを追加", command=self.add_bus)
         m.add_command(label="クロックを追加...", command=self.add_clock)
+        m.add_command(label="多値信号を追加...", command=self.add_multi)
         m.add_separator()
         m.add_command(label="マーカーを追加...", command=self.add_marker)
         bar.add_cascade(label="挿入", menu=m)
@@ -149,6 +182,7 @@ class App(tk.Tk):
         ttk.Button(tb, text="＋信号", command=self.add_signal).pack(side="left")
         ttk.Button(tb, text="＋バス", command=self.add_bus).pack(side="left", padx=(4, 0))
         ttk.Button(tb, text="＋クロック", command=self.add_clock).pack(side="left", padx=(4, 0))
+        ttk.Button(tb, text="＋多値", command=self.add_multi).pack(side="left", padx=(4, 0))
         ttk.Button(tb, text="＋マーカー", command=self.add_marker).pack(side="left", padx=(4, 0))
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=10)
 
@@ -366,9 +400,13 @@ class App(tk.Tk):
             if sig.is_bus:
                 self.edit_bus_value(row, t)
                 return
-            cells = sig.cells()
-            cur = cells[t].state if t < len(cells) else "0"
-            value = "0" if cur in ("1", "p", "n") else "1"
+            if sig.is_multi:
+                # 多値信号: クリックした高さの値にする（ドラッグ中もマウスの高さに追従）
+                value = str(self.layout.level_at(row, self._xy(event)[1], sig.max_level))
+            else:
+                cells = sig.cells()
+                cur = cells[t].state if t < len(cells) else "0"
+                value = "0" if cur in ("1", "p", "n") else "1"
             self._paint = {"row": row, "value": value, "last": None}
             self._paint_at(t)
         elif hit[0] == "name":
@@ -384,9 +422,9 @@ class App(tk.Tk):
 
     def _paint_at(self, t: int) -> None:
         p = self._paint
-        if p["last"] == t:
+        if p["last"] == (t, p["value"]):
             return
-        p["last"] = t
+        p["last"] = (t, p["value"])
         sig = self.chart.signals[p["row"]]
         cells = sig.cells()
         if t < len(cells) and cells[t].state == p["value"]:
@@ -397,15 +435,19 @@ class App(tk.Tk):
     def on_motion(self, event) -> None:
         x, y = self._xy(event)
         if self._paint and self.layout:
+            row = self._paint["row"]
+            sig = self.chart.signals[row]
+            if sig.is_multi:
+                self._paint["value"] = str(self.layout.level_at(row, y, sig.max_level))
             t = int((x - self.layout.x0) // self.layout.cell_w)
             if 0 <= t < self.layout.n_cells:
                 self._paint_at(t)
         elif self._row_drag and self.layout:
             lay = self.layout
-            target = max(0, min(lay.n_rows, round((y - lay.rows_top) / lay.row_h)))
+            target = lay.nearest_boundary(y)
             self._row_drag["target"] = target
             self.canvas.delete("dragline")
-            yy = lay.rows_top + target * lay.row_h
+            yy = lay.row_bounds[target]
             self.canvas.create_line(4, yy, lay.width, yy, fill="#2563eb", width=3, tags="dragline")
 
     def on_release(self, _event) -> None:
@@ -456,12 +498,17 @@ class App(tk.Tk):
                 sig.set_cell(t, Cell(state))
                 self.commit()
 
-            menu.add_command(label="High (1)", command=lambda: setc("1"))
-            menu.add_command(label="Low (0)", command=lambda: setc("0"))
-            menu.add_command(label="不定 (x)", command=lambda: setc("x"))
-            menu.add_command(label="クロック 立ち上がり (p)", command=lambda: setc("p"))
-            menu.add_command(label="クロック 立ち下がり (n)", command=lambda: setc("n"))
-            menu.add_command(label="バス値...", command=lambda: self.edit_bus_value(row, t))
+            if sig.is_multi:
+                for v in range(sig.max_level, -1, -1):
+                    menu.add_command(label=f"値 {sig.level_label(v)}", command=lambda v=v: setc(str(v)))
+                menu.add_command(label="不定 (x)", command=lambda: setc("x"))
+            else:
+                menu.add_command(label="High (1)", command=lambda: setc("1"))
+                menu.add_command(label="Low (0)", command=lambda: setc("0"))
+                menu.add_command(label="不定 (x)", command=lambda: setc("x"))
+                menu.add_command(label="クロック 立ち上がり (p)", command=lambda: setc("p"))
+                menu.add_command(label="クロック 立ち下がり (n)", command=lambda: setc("n"))
+                menu.add_command(label="バス値...", command=lambda: self.edit_bus_value(row, t))
             menu.add_separator()
             menu.add_command(label=f"{t} サイクル目の前に 1 サイクル挿入",
                              command=lambda: (self.chart.insert_cycle(t), self.commit()))
@@ -489,6 +536,10 @@ class App(tk.Tk):
                          command=lambda: self.move_signal(row, -1))
         menu.add_command(label="下へ移動", state="normal" if row < n - 1 else "disabled",
                          command=lambda: self.move_signal(row, 1))
+        if not self.chart.signals[row].is_bus:
+            menu.add_command(label="最大値を設定（多値信号）...", command=lambda: self.set_max_level(row))
+        if self.chart.signals[row].is_multi:
+            menu.add_command(label="値の意味を設定...", command=lambda: self.edit_level_names(row))
         menu.add_command(label="複製", command=lambda: self.duplicate_signal(row))
         menu.add_command(label="削除", command=lambda: self.delete_signal(row))
 
@@ -535,6 +586,35 @@ class App(tk.Tk):
         self.chart.signals.append(Signal(name, clock_wave(self._length_or_default(), period, rising)))
         self.commit()
 
+    def _ask_max_level(self, initial: int) -> int | None:
+        return simpledialog.askinteger(
+            "多値信号", f"最大値（2〜{MAX_LEVEL_LIMIT}、1 にすると通常の High/Low 信号）",
+            initialvalue=initial, minvalue=1, maxvalue=MAX_LEVEL_LIMIT, parent=self)
+
+    def add_multi(self) -> None:
+        max_level = self._ask_max_level(DEFAULT_MULTI_MAX)
+        if max_level is None:
+            return
+        n = self._length_or_default()
+        self.chart.signals.append(Signal(self._unique_name("LEVEL"), "0" + "." * (n - 1), max_level=max_level))
+        self.commit()
+
+    def set_max_level(self, row: int) -> None:
+        sig = self.chart.signals[row]
+        max_level = self._ask_max_level(sig.max_level if sig.is_multi else DEFAULT_MULTI_MAX)
+        if max_level is None:
+            return
+        sig.set_max_level(max_level)
+        self.commit()
+
+    def edit_level_names(self, row: int) -> None:
+        sig = self.chart.signals[row]
+        dlg = LevelNamesDialog(self, sig)
+        if dlg.result is None:
+            return
+        sig.level_names = dlg.result
+        self.commit()
+
     def add_marker(self, time: int | None = None) -> None:
         if time is None:
             time = simpledialog.askinteger("マーカー", "時刻（サイクル境界の番号）", minvalue=0,
@@ -573,7 +653,8 @@ class App(tk.Tk):
 
     def duplicate_signal(self, row: int) -> None:
         src = self.chart.signals[row]
-        self.chart.signals.insert(row + 1, Signal(self._unique_name(src.name), src.wave, list(src.data)))
+        self.chart.signals.insert(row + 1, Signal(self._unique_name(src.name), src.wave, list(src.data), src.max_level,
+                                                 dict(src.level_names)))
         self.commit()
 
     def delete_signal(self, row: int) -> None:

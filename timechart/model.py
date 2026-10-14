@@ -4,6 +4,7 @@
 
     0 : Low
     1 : High
+    2-9 : 多値信号のレベル（max_level 以下）
     p : クロック（立ち上がりから始まる 1 周期）
     n : クロック（立ち下がりから始まる 1 周期）
     x : 不定
@@ -16,8 +17,14 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STATES = "01pnx="
+STATES = "0123456789pnx="
 WAVE_CHARS = STATES + "."
+MAX_LEVEL_LIMIT = 9
+DEFAULT_MULTI_MAX = 5
+
+
+def wave_max_digit(wave: str) -> int:
+    return max((int(ch) for ch in wave if ch.isdigit()), default=0)
 
 
 @dataclass
@@ -84,10 +91,32 @@ class Signal:
     name: str
     wave: str = ""
     data: list[str] = field(default_factory=list)
+    max_level: int = 1  # 2 以上なら多値信号（0〜max_level）
+    level_names: dict[int, str] = field(default_factory=dict)  # 多値信号の各値の意味（例: {0: "停止"}）
 
     @property
     def is_bus(self) -> bool:
         return "=" in self.wave
+
+    @property
+    def is_multi(self) -> bool:
+        return self.max_level > 1
+
+    def set_max_level(self, n: int) -> None:
+        """最大値を変更する。最大値を超えるレベルは最大値に丸める。"""
+        n = max(1, min(MAX_LEVEL_LIMIT, n))
+        cells = self.cells()
+        for c in cells:
+            if c.state.isdigit() and int(c.state) > n:
+                c.state = str(n)
+        self.max_level = n
+        self.level_names = {k: v for k, v in self.level_names.items() if k <= n} if n > 1 else {}
+        self.set_cells(cells)
+
+    def level_label(self, level: int) -> str:
+        """値の表示用ラベル。意味が設定されていれば「2:低速」の形にする。"""
+        name = self.level_names.get(level, "")
+        return f"{level}:{name}" if name else str(level)
 
     def cells(self) -> list[Cell]:
         return expand(self.wave, self.data)
@@ -199,7 +228,10 @@ class Chart:
     def to_dict(self) -> dict:
         return {
             "title": self.title,
-            "signals": [{"name": s.name, "wave": s.wave, "data": list(s.data)} for s in self.signals],
+            "signals": [{"name": s.name, "wave": s.wave, "data": list(s.data),
+                         **({"max": s.max_level} if s.is_multi else {}),
+                         **({"levels": {str(k): v for k, v in sorted(s.level_names.items())}}
+                            if s.is_multi and s.level_names else {})} for s in self.signals],
             "markers": [{"time": m.time, "label": m.label} for m in self.markers],
         }
 
@@ -211,7 +243,14 @@ class Chart:
             bad = set(wave) - set(WAVE_CHARS)
             if bad:
                 raise ValueError(f"信号 {s.get('name')!r} に使用できない文字があります: {''.join(sorted(bad))}")
-            signals.append(Signal(str(s.get("name", "")), wave, [str(v) for v in s.get("data", [])]))
+            max_level = int(s.get("max", 1))
+            if not 1 <= max_level <= MAX_LEVEL_LIMIT or wave_max_digit(wave) > max_level:
+                raise ValueError(f"信号 {s.get('name')!r} の値が最大値 {max_level} を超えています")
+            names = {int(k): str(v) for k, v in dict(s.get("levels", {})).items() if str(v)}
+            if any(not 0 <= k <= max_level for k in names):
+                raise ValueError(f"信号 {s.get('name')!r} の値の意味が最大値 {max_level} の範囲外です")
+            signals.append(Signal(str(s.get("name", "")), wave, [str(v) for v in s.get("data", [])], max_level,
+                                  names if max_level > 1 else {}))
         markers = [Marker(int(m["time"]), str(m.get("label", ""))) for m in d.get("markers", [])]
         return cls(str(d.get("title", "")), signals, markers)
 
@@ -245,6 +284,7 @@ def sample_chart() -> Chart:
             Signal("CLK", clock_wave(16, 1)),
             Signal("CS_N", "1.0...........1."),
             Signal("EN", "0..1........0..."),
+            Signal("LEVEL", "0...2...5.3...0.", max_level=5, level_names={0: "停止", 2: "低速", 5: "高速"}),
             Signal("DATA[7:0]", "x...=...=...=.x.", ["0x1F", "0xA0", "0x3C"]),
         ],
         markers=[Marker(4, "t1"), Marker(12, "t2")],

@@ -19,6 +19,7 @@ class Style:
     cell_w: float = 40
     row_h: float = 44
     wave_h: float = 24
+    level_h: float = 13  # 多値信号の 1 レベルあたりの高さ
     margin: float = 16
     axis_h: float = 26
     marker_h: float = 26
@@ -26,6 +27,7 @@ class Style:
     title_size: int = 18
     font_size: int = 14
     small_size: int = 12
+    value_size: int = 10
     show_grid: bool = True
 
     background: str = "#ffffff"
@@ -62,7 +64,7 @@ class Text:
     color: str
     size: int
     bold: bool = False
-    anchor: str = "w"  # w / e / center / n / s
+    anchor: str = "w"  # w / e / center / n / s / nw / sw
 
 
 Primitive = Line | Poly | Text
@@ -77,29 +79,47 @@ class Layout:
     n_cells: int
     axis_top: float
     axis_bottom: float
-    rows_top: float
-    row_h: float
-    n_rows: int
+    row_bounds: list[float]  # 行の境界の y 座標（行数 + 1 個）
+    waves: list[tuple[float, float]]  # 各行の波形の上端・下端
     width: float
     height: float
 
     @property
+    def n_rows(self) -> int:
+        return len(self.waves)
+
+    @property
+    def rows_top(self) -> float:
+        return self.row_bounds[0]
+
+    @property
     def rows_bottom(self) -> float:
-        return self.rows_top + self.n_rows * self.row_h
+        return self.row_bounds[-1]
 
     def x_of(self, t: float) -> float:
         return self.x0 + t * self.cell_w
 
-    def row_at(self, y: float) -> int:
-        """y 位置の行（範囲外は端に丸める）。"""
-        return max(0, min(self.n_rows - 1, int((y - self.rows_top) // self.row_h)))
+    def row_at(self, y: float) -> int | None:
+        for i in range(self.n_rows):
+            if self.row_bounds[i] <= y < self.row_bounds[i + 1]:
+                return i
+        return None
+
+    def nearest_boundary(self, y: float) -> int:
+        """y に最も近い行の境界の番号（行の並べ替え先）。"""
+        return min(range(len(self.row_bounds)), key=lambda i: abs(self.row_bounds[i] - y))
+
+    def level_at(self, row: int, y: float, max_level: int) -> int:
+        """多値信号の行で、y 位置に対応するレベル。"""
+        top, bot = self.waves[row]
+        return max(0, min(max_level, round((bot - y) / (bot - top) * max_level)))
 
     def hit(self, x: float, y: float) -> tuple | None:
         if self.axis_top <= y < self.axis_bottom and x >= self.x0 - self.cell_w / 2:
             t = round((x - self.x0) / self.cell_w)
             return ("axis", max(0, min(self.n_cells, t)))
-        if self.n_rows and self.rows_top <= y < self.rows_bottom:
-            row = int((y - self.rows_top) // self.row_h)
+        row = self.row_at(y)
+        if row is not None:
             if x < self.x0:
                 return ("name", row)
             t = int((x - self.x0) // self.cell_w)
@@ -123,15 +143,16 @@ def fit_text(text: str, avail: float, size: int, measure: Measure) -> str:
     return text + "…" if text else ""
 
 
-def wave_segments(cells: list[Cell]) -> list[list]:
+def wave_segments(cells: list[Cell], max_level: int = 1) -> list[list]:
     """セル列を [種類, 開始時刻, 終了時刻, ラベル] の区間に変換する。
 
-    クロック(p/n)は半周期ごとの 0/1 に分解し、同じレベルが続く区間は結合する。
+    クロック(p/n)は半周期ごとの 0 / 最大値 に分解し、同じレベルが続く区間は結合する。
     """
+    high = str(max_level)
     fine: list[tuple] = []
     for i, c in enumerate(cells):
         if c.state in ("p", "n"):
-            a, b = ("1", "0") if c.state == "p" else ("0", "1")
+            a, b = (high, "0") if c.state == "p" else ("0", high)
             fine.append((a, i, i + 0.5, "", True))
             fine.append((b, i + 0.5, i + 1, "", True))
         else:
@@ -155,29 +176,53 @@ def _hatch(prims: list, a: float, b: float, top: float, bot: float, color: str) 
         u += 7
 
 
+def wave_height(max_level: int, style: Style) -> float:
+    return max(style.wave_h, style.level_h * max_level) if max_level > 1 else style.wave_h
+
+
+def axis_label(level: int, names: dict[int, str]) -> str:
+    """多値信号の左側の一覧に書く文字（例: "2 低速"）。"""
+    return f"{level} {names[level]}" if names.get(level) else str(level)
+
+
 def draw_wave(prims: list, cells: list[Cell], x0: float, cw: float, top: float, bot: float,
-              style: Style, measure: Measure) -> None:
+              style: Style, measure: Measure, max_level: int = 1,
+              level_names: dict[int, str] | None = None) -> None:
+    level_names = level_names or {}
     mid = (top + bot) / 2
     s = min(4.0, cw / 8)
-    segs = wave_segments(cells)
+    multi = max_level > 1
+
+    def level_y(kind: str) -> float:
+        return bot - (bot - top) * min(int(kind), max_level) / max_level
+
+    segs = wave_segments(cells, max_level)
     for j, (kind, t0, t1, label) in enumerate(segs):
         prev = segs[j - 1] if j > 0 else None
         nxt = segs[j + 1] if j + 1 < len(segs) else None
         xa, xb = x0 + t0 * cw, x0 + t1 * cw
         sl = s if prev else 0
         sr = s if nxt else 0
-        if kind in ("0", "1"):
-            y = top if kind == "1" else bot
+        if kind.isdigit():
+            y = level_y(kind)
             pts: list[float] = []
-            if prev and prev[0] not in ("0", "1"):
+            if prev and not prev[0].isdigit():
                 pts += [xa, mid]
             pts += [xa + sl, y, xb - sr, y]
             if nxt:
-                if nxt[0] in ("0", "1"):
-                    pts += [xb + sr, top if nxt[0] == "1" else bot]
-                else:
-                    pts += [xb, mid]
+                pts += [xb + sr, level_y(nxt[0])] if nxt[0].isdigit() else [xb, mid]
             prims.append(Line(pts, style.line, 2))
+            # 値は区間の左端（変化の直後）に書く。中央だと補助線やマーカーと重なりやすい
+            # 意味が設定されていれば「2:低速」、入りきらなければ数字だけにする
+            if multi:
+                avail = (xb - sr) - (xa + sl) - 6
+                name = level_names.get(int(kind))
+                shown = next((t for t in ([f"{kind}:{name}"] if name else []) + [kind]
+                              if measure(t, style.value_size, False) <= avail), None)
+                if shown:
+                    at_top = int(kind) >= max_level
+                    prims.append(Text(xa + sl + 3, y + 3 if at_top else y - 3, shown, style.muted,
+                                      style.value_size, anchor="nw" if at_top else "sw"))
             continue
         left = [xa, mid] if prev else []
         right = [xb, mid] if nxt else []
@@ -199,7 +244,10 @@ def build(chart: Chart, style: Style, measure: Measure) -> tuple[list[Primitive]
     n = chart.length
     cw = style.cell_w
     name_w = max([measure(s.name, style.font_size, True) for s in chart.signals] + [48])
-    x0 = m + name_w + style.name_gap
+    # 多値信号の左側の値一覧（縦軸）の幅
+    axis_w = max([measure(axis_label(k, s.level_names), style.value_size, False)
+                  for s in chart.signals if s.is_multi for k in range(s.max_level + 1)], default=0)
+    x0 = m + name_w + style.name_gap + (axis_w + 12 if axis_w else 0)
     x_end = x0 + n * cw
 
     y = m
@@ -209,17 +257,24 @@ def build(chart: Chart, style: Style, measure: Measure) -> tuple[list[Primitive]
         title_w = measure(chart.title, style.title_size, True)
         y += style.title_size + 12
     axis_top, axis_bottom = y, y + style.axis_h
-    rows_top = axis_bottom + 4
-    rows_bottom = rows_top + len(chart.signals) * style.row_h
+
+    # 行の配置（多値信号の行は最大値に応じて高くする）
+    pad = style.row_h - style.wave_h
+    row_bounds = [axis_bottom + 4]
+    waves: list[tuple[float, float]] = []
+    for sig in chart.signals:
+        wh = wave_height(sig.max_level, style)
+        top = row_bounds[-1] + pad / 2
+        waves.append((top, top + wh))
+        row_bounds.append(row_bounds[-1] + wh + pad)
+    rows_bottom = row_bounds[-1]
     height = rows_bottom + (style.marker_h if chart.markers else 6) + m
     width = max(x_end + m + 8, m * 2 + title_w)
 
     # 行の背景（縞模様）
-    for i in range(len(chart.signals)):
-        if i % 2 == 0:
-            top = rows_top + i * style.row_h
-            prims.append(Poly([m / 2, top, x_end + 6, top, x_end + 6, top + style.row_h, m / 2, top + style.row_h],
-                              style.zebra))
+    for i in range(0, len(chart.signals), 2):
+        top, bot = row_bounds[i], row_bounds[i + 1]
+        prims.append(Poly([m / 2, top, x_end + 6, top, x_end + 6, bot, m / 2, bot], style.zebra))
 
     # 補助線
     if style.show_grid:
@@ -238,10 +293,16 @@ def build(chart: Chart, style: Style, measure: Measure) -> tuple[list[Primitive]
             prims.append(Text(x, axis_bottom - 8, str(t), style.muted, style.small_size, anchor="s"))
 
     # 信号
-    for i, sig in enumerate(chart.signals):
-        cy = rows_top + i * style.row_h + style.row_h / 2
+    for sig, (top, bot) in zip(chart.signals, waves):
+        cy = (top + bot) / 2
         prims.append(Text(m, cy, sig.name, style.text, style.font_size, bold=True))
-        draw_wave(prims, sig.cells(), x0, cw, cy - style.wave_h / 2, cy + style.wave_h / 2, style, measure)
+        if sig.is_multi:
+            for k in range(sig.max_level + 1):
+                ly = bot - (bot - top) * k / sig.max_level
+                prims.append(Line([x0 - 6, ly, x0 - 2, ly], style.muted, 1))
+                prims.append(Text(x0 - 9, ly, axis_label(k, sig.level_names), style.muted, style.value_size,
+                                  anchor="e"))
+        draw_wave(prims, sig.cells(), x0, cw, top, bot, style, measure, sig.max_level, sig.level_names)
 
     # マーカー
     for mk in chart.markers:
@@ -252,5 +313,5 @@ def build(chart: Chart, style: Style, measure: Measure) -> tuple[list[Primitive]
                 prims.append(Text(x, rows_bottom + 6, mk.label, style.marker, style.small_size, bold=True,
                                   anchor="n"))
 
-    layout = Layout(x0, cw, n, axis_top, axis_bottom, rows_top, style.row_h, len(chart.signals), width, height)
+    layout = Layout(x0, cw, n, axis_top, axis_bottom, row_bounds, waves, width, height)
     return prims, layout

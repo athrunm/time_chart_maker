@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .model import Chart
 from .render import Line, Poly, Style, Text, build
 
-PIL_ANCHOR = {"w": "lm", "e": "rm", "center": "mm", "n": "mt", "s": "mb"}
+PIL_ANCHOR = {"w": "lm", "e": "rm", "center": "mm", "n": "mt", "s": "mb", "nw": "lt", "sw": "lb"}
 
 _FONT_CANDIDATES = {
     False: [

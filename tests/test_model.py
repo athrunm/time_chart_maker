@@ -91,7 +91,8 @@ def test_wave_segments_merge_clock_halves():
 
 def test_layout_hit():
     _, lay = build(sample_chart(), Style(), measure)
-    assert lay.hit(lay.x_of(3.5), lay.rows_top + lay.row_h * 1.5) == ("cell", 1, 3)
+    mid1 = (lay.row_bounds[1] + lay.row_bounds[2]) / 2
+    assert lay.hit(lay.x_of(3.5), mid1) == ("cell", 1, 3)
     assert lay.hit(lay.x0 - 5, lay.rows_top + 1) == ("name", 0)
     assert lay.hit(lay.x_of(4.2), lay.axis_top + 1) == ("axis", 4)
 
@@ -112,3 +113,67 @@ def test_load_rejects_bad_wave(tmp_path):
     path.write_text(json.dumps({"signals": [{"name": "A", "wave": "01q"}]}), encoding="utf-8")
     with pytest.raises(ValueError):
         load_file(path)
+
+
+def test_multi_level_text_roundtrip():
+    c = parse_chart("LEVEL : 0.2.5.3. | max=5\nAUTO : 0.3.\nSMALL : 0.2. | max=3\n")
+    assert [(s.wave, s.max_level, s.data) for s in c.signals] == [
+        ("0.2.5.3.", 5, []), ("0.3.", 5, []), ("0.2.", 3, [])]
+    text = format_chart(c)
+    assert "AUTO  : 0.3. | max=5" in text
+    assert format_chart(parse_chart(text)) == text
+
+
+@pytest.mark.parametrize("text", ["A : 0.6. | max=5\n", "A : 0. | max=10\n", "A : =.3. | X\n"])
+def test_multi_level_errors(text):
+    with pytest.raises(ParseError):
+        parse_chart(text)
+
+
+def test_set_max_level_clamps():
+    s = Signal("L", "0.5.3.", max_level=5)
+    s.set_max_level(3)
+    assert (s.wave, s.max_level) == ("0.3...", 3)
+
+
+def test_multi_level_layout_and_render(tmp_path):
+    chart = Chart(signals=[Signal("A", "01"), Signal("L", "0525", max_level=5)])
+    prims, lay = build(chart, Style(), measure)
+    top, bot = lay.waves[1]
+    assert bot - top > lay.waves[0][1] - lay.waves[0][0]  # 多値の行は高い
+    assert lay.level_at(1, top, 5) == 5
+    assert lay.level_at(1, bot, 5) == 0
+    assert lay.level_at(1, (top + bot) / 2, 4) == 2
+    assert lay.nearest_boundary(lay.rows_bottom + 50) == 2
+    texts = [p.text for p in prims if hasattr(p, "text")]
+    assert {"0", "5", "2"} <= set(texts)  # 左側の一覧と区間の値
+    path = tmp_path / "m.json"
+    save_file(path, chart)
+    assert load_file(path)[0] == chart
+
+
+def test_level_names_text_roundtrip():
+    c = parse_chart("L : 0.2.5. | max=5, 0=停止, 2=低速, 5=高速\nB : 0.3. | 0=OFF\n")
+    assert c.signals[0].level_names == {0: "停止", 2: "低速", 5: "高速"}
+    assert (c.signals[1].max_level, c.signals[1].level_names) == (5, {0: "OFF"})
+    text = format_chart(c)
+    assert "L : 0.2.5. | max=5, 0=停止, 2=低速, 5=高速" in text
+    assert format_chart(parse_chart(text)) == text
+    with pytest.raises(ParseError):
+        parse_chart("L : 0.2. | max=3, 4=過大\n")
+
+
+def test_level_names_model_and_render(tmp_path):
+    s = Signal("L", "0.5.", max_level=5, level_names={0: "停止", 5: "高速"})
+    assert s.level_label(5) == "5:高速" and s.level_label(3) == "3"
+    s.set_max_level(3)
+    assert s.level_names == {0: "停止"}
+    chart = Chart(signals=[Signal("L", "0...2...", max_level=5, level_names={0: "停止", 2: "低速"})])
+    path = tmp_path / "n.json"
+    save_file(path, chart)
+    assert load_file(path)[0] == chart
+    texts = [p.text for p in build(chart, Style(cell_w=40), measure)[0] if hasattr(p, "text")]
+    assert "0 停止" in texts and "2 低速" in texts  # 左側の一覧
+    assert "0:停止" in texts and "2:低速" in texts  # 区間の表示
+    narrow = [p.text for p in build(chart, Style(cell_w=6), measure)[0] if hasattr(p, "text")]
+    assert "2:低速" not in narrow  # 狭いと数字だけ（または非表示）
