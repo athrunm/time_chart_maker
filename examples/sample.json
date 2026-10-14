@@ -1,0 +1,45 @@
+{
+  "app": "time_chart_maker",
+  "version": 1,
+  "title": "サンプル: データ転送",
+  "signals": [
+    {
+      "name": "CLK",
+      "wave": "p...............",
+      "data": []
+    },
+    {
+      "name": "CS_N",
+      "wave": "1.0...........1.",
+      "data": []
+    },
+    {
+      "name": "EN",
+      "wave": "0..1........0...",
+      "data": []
+    },
+    {
+      "name": "DATA[7:0]",
+      "wave": "x...=...=...=.x.",
+      "data": [
+        "0x1F",
+        "0xA0",
+        "0x3C"
+      ]
+    }
+  ],
+  "markers": [
+    {
+      "time": 4,
+      "label": "t1"
+    },
+    {
+      "time": 12,
+      "label": "t2"
+    }
+  ],
+  "settings": {
+    "cell_w": 40,
+    "show_grid": true
+  }
+}
